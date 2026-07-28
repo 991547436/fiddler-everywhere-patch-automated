@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+Generic Fiddler Everywhere IntegrityCheckService patcher.
+
+It parses .NET metadata to locate:
+  Fiddler.WebUi.Services.IntegrityCheckService.ExecuteAsync(...)
+and rewrites the method body to:
+  call System.Threading.Tasks.Task::get_CompletedTask
+  ret
+
+No fixed RVA/file offset is used. The only semantic assumptions are the type,
+method and return helper names.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+
+try:
+    import dnfile
+except Exception as exc:  # pragma: no cover
+    raise SystemExit("Missing dependency: dnfile. Install with: python -m pip install dnfile") from exc
+
+TARGET_NS = "Fiddler.WebUi.Services"
+TARGET_TYPE = "IntegrityCheckService"
+TARGET_METHOD = "ExecuteAsync"
+TASK_TYPE = "System.Threading.Tasks.Task"
+TASK_COMPLETED = "get_CompletedTask"
+
+
+@dataclass(frozen=True)
+class MethodBodyInfo:
+    body_offset: int
+    code_offset: int
+    code_size: int
+    header_size: int
+    header_kind: str
+
+
+@dataclass(frozen=True)
+class PatchTarget:
+    type_name: str
+    method_name: str
+    method_token: int
+    method_rva: int
+    body: MethodBodyInfo
+    completed_task_token: int
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest().upper()
+
+
+def type_full_name(row_or_index) -> str:
+    row = getattr(row_or_index, "row", row_or_index)
+    if row is None:
+        return ""
+    if hasattr(row, "TypeNamespace") and hasattr(row, "TypeName"):
+        ns = str(row.TypeNamespace)
+        name = str(row.TypeName)
+        return f"{ns}.{name}" if ns else name
+    if hasattr(row, "Namespace") and hasattr(row, "Name"):
+        ns = str(row.Namespace)
+        name = str(row.Name)
+        return f"{ns}.{name}" if ns else name
+    if hasattr(row, "Name"):
+        return str(row.Name)
+    return str(row)
+
+
+def method_names(type_def) -> list[str]:
+    names: list[str] = []
+    for mref in getattr(type_def, "MethodList", []):
+        try:
+            names.append(str(mref.row.Name))
+        except Exception:
+            pass
+    return names
+
+
+def find_completed_task_token(dn) -> int:
+    rows = getattr(dn.net.mdtables, "MemberRef").rows
+    exact: list[tuple[int, str]] = []
+    loose: list[tuple[int, str]] = []
+
+    for index, row in enumerate(rows, 1):
+        name = str(row.Name)
+        if name != TASK_COMPLETED:
+            continue
+        owner = type_full_name(row.Class)
+        token = 0x0A000000 | index
+        if owner == TASK_TYPE:
+            exact.append((token, owner))
+        elif owner.endswith(".Task") or owner == "Task":
+            loose.append((token, owner))
+
+    if exact:
+        return exact[0][0]
+    if loose:
+        return loose[0][0]
+    raise RuntimeError(f"Could not find MemberRef {TASK_TYPE}::{TASK_COMPLETED}")
+
+
+def iter_type_defs(dn) -> Iterable:
+    return getattr(dn.net.mdtables, "TypeDef").rows
+
+
+def find_integrity_type(dn):
+    exact = []
+    fallback = []
+    for td in iter_type_defs(dn):
+        full = type_full_name(td)
+        names = method_names(td)
+        if TARGET_METHOD not in names:
+            continue
+        if full == f"{TARGET_NS}.{TARGET_TYPE}":
+            exact.append(td)
+            continue
+        # Fallback for minor namespace/name shifts in nearby versions.
+        if TARGET_TYPE in full or "Integrity" in full:
+            fallback.append(td)
+            continue
+        # Fallback for services that still inherit BackgroundService.
+        try:
+            parent = type_full_name(td.Extends)
+        except Exception:
+            parent = ""
+        if parent.endswith("BackgroundService") and "Check" in full:
+            fallback.append(td)
+
+    if exact:
+        return exact[0]
+    if len(fallback) == 1:
+        return fallback[0]
+    if fallback:
+        joined = "\n  ".join(type_full_name(x) for x in fallback)
+        raise RuntimeError("Multiple possible integrity services found; specify --type-full-name:\n  " + joined)
+    raise RuntimeError(f"Could not find {TARGET_NS}.{TARGET_TYPE}.{TARGET_METHOD}")
+
+
+def find_method(type_def, name: str):
+    for mref in type_def.MethodList:
+        if str(mref.row.Name) == name:
+            return mref.row_index, mref.row
+    raise RuntimeError(f"Type {type_full_name(type_def)} does not contain method {name}")
+
+
+def parse_method_body(data: bytes | bytearray, body_offset: int) -> MethodBodyInfo:
+    first = data[body_offset]
+    fmt = first & 0x03
+    if fmt == 0x02:  # tiny header
+        code_size = first >> 2
+        return MethodBodyInfo(
+            body_offset=body_offset,
+            code_offset=body_offset + 1,
+            code_size=code_size,
+            header_size=1,
+            header_kind="tiny",
+        )
+    if fmt == 0x03:  # fat header
+        flags_and_size = int.from_bytes(data[body_offset : body_offset + 2], "little")
+        header_size = ((flags_and_size >> 12) & 0x0F) * 4
+        code_size = int.from_bytes(data[body_offset + 4 : body_offset + 8], "little")
+        return MethodBodyInfo(
+            body_offset=body_offset,
+            code_offset=body_offset + header_size,
+            code_size=code_size,
+            header_size=header_size,
+            header_kind="fat",
+        )
+    raise RuntimeError(f"Unsupported method body header at 0x{body_offset:X}: 0x{first:02X}")
+
+
+def locate_target(path: Path, type_full_name_override: Optional[str] = None) -> tuple[object, PatchTarget]:
+    dn = dnfile.dnPE(str(path))
+    if not dn.net:
+        raise RuntimeError(f"Not a .NET assembly: {path}")
+
+    if type_full_name_override:
+        matches = [td for td in iter_type_defs(dn) if type_full_name(td) == type_full_name_override]
+        if not matches:
+            raise RuntimeError(f"Specified type not found: {type_full_name_override}")
+        type_def = matches[0]
+    else:
+        type_def = find_integrity_type(dn)
+
+    method_index, method = find_method(type_def, TARGET_METHOD)
+    completed_token = find_completed_task_token(dn)
+    body_offset = dn.get_offset_from_rva(method.Rva)
+    body = parse_method_body(path.read_bytes(), body_offset)
+
+    target = PatchTarget(
+        type_name=type_full_name(type_def),
+        method_name=str(method.Name),
+        method_token=0x06000000 | method_index,
+        method_rva=int(method.Rva),
+        body=body,
+        completed_task_token=completed_token,
+    )
+    return dn, target
+
+
+def expected_il(completed_task_token: int) -> bytes:
+    # 0x28 = call, operand = metadata token, 0x2A = ret
+    return bytes([0x28]) + completed_task_token.to_bytes(4, "little") + bytes([0x2A])
+
+
+def is_patched(data: bytes | bytearray, target: PatchTarget) -> bool:
+    body = target.body
+    return data[body.code_offset : body.code_offset + 6] == expected_il(target.completed_task_token)
+
+
+def patch_file(path: Path, *, dry_run: bool, type_full_name_override: Optional[str], backup_suffix: str) -> int:
+    path = path.resolve()
+    data = bytearray(path.read_bytes())
+    before_hash = sha256(path)
+    dn, target = locate_target(path, type_full_name_override)
+    try:
+        print(f"Target file:        {path}")
+        print(f"Assembly SHA256:    {before_hash}")
+        print(f"Target type:        {target.type_name}")
+        print(f"Target method:      {target.method_name}")
+        print(f"MethodDef token:    0x{target.method_token:08X}")
+        print(f"Method RVA:         0x{target.method_rva:X}")
+        print(f"Method body offset: 0x{target.body.body_offset:X}")
+        print(f"Code offset:        0x{target.body.code_offset:X}")
+        print(f"Code size:          {target.body.code_size}")
+        print(f"Header kind:        {target.body.header_kind}")
+        print(f"CompletedTask ref:  0x{target.completed_task_token:08X}")
+
+        new_il = expected_il(target.completed_task_token)
+        if target.body.code_size < len(new_il):
+            raise RuntimeError(f"Method body too small: {target.body.code_size} bytes")
+
+        if is_patched(data, target):
+            print("Status:             already patched")
+            return 0
+
+        if dry_run:
+            print("Status:             dry-run only; no file was changed")
+            return 0
+
+        backup = path.with_name(path.name + backup_suffix)
+        if not backup.exists():
+            shutil.copy2(path, backup)
+            print(f"Backup:             {backup}")
+        else:
+            print(f"Backup:             {backup} (already exists)")
+
+        # Preserve original method code size and exception-section layout.
+        # The replacement returns immediately; remaining bytes are NOP padding.
+        start = target.body.code_offset
+        end = start + target.body.code_size
+        data[start:end] = new_il + bytes([0x00]) * (target.body.code_size - len(new_il))
+    finally:
+        try:
+            dn.close()
+        except Exception:
+            pass
+
+    path.write_bytes(data)
+    after_hash = sha256(path)
+    print("Status:             patched")
+    print(f"New SHA256:         {after_hash}")
+    return 0
+
+
+def restore_file(path: Path, backup_suffix: str) -> int:
+    path = path.resolve()
+    backup = path.with_name(path.name + backup_suffix)
+    if not backup.exists():
+        raise RuntimeError(f"Backup not found: {backup}")
+    shutil.copy2(backup, path)
+    print(f"Restored: {path}")
+    print(f"SHA256:   {sha256(path)}")
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Generic Fiddler.WebUi.dll integrity-check patcher")
+    parser.add_argument(
+        "dll",
+        nargs="?",
+        default=str(Path("FiddlerEverywhere") / "resources" / "app" / "out" / "WebServer" / "Fiddler.WebUi.dll"),
+        help="Path to Fiddler.WebUi.dll",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Locate target and print plan without writing")
+    parser.add_argument("--restore", action="store_true", help="Restore from backup")
+    parser.add_argument("--backup-suffix", default=".bak-integrity", help="Backup suffix")
+    parser.add_argument("--type-full-name", help="Override target type full name if autodetection is ambiguous")
+    args = parser.parse_args(argv)
+
+    path = Path(args.dll)
+    if args.restore:
+        return restore_file(path, args.backup_suffix)
+    return patch_file(
+        path,
+        dry_run=args.dry_run,
+        type_full_name_override=args.type_full_name,
+        backup_suffix=args.backup_suffix,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
