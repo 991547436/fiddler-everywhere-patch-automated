@@ -215,9 +215,32 @@ def expected_il(completed_task_token: int) -> bytes:
     return bytes([0x28]) + completed_task_token.to_bytes(4, "little") + bytes([0x2A])
 
 
+def expected_tiny_body(completed_task_token: int) -> bytes:
+    il = expected_il(completed_task_token)
+    if len(il) >= 64:
+        raise ValueError("Tiny method body supports code size below 64 bytes")
+    # Tiny method header: low bits 0b10, upper six bits = code size.
+    return bytes([(len(il) << 2) | 0x02]) + il
+
+
 def is_patched(data: bytes | bytearray, target: PatchTarget) -> bool:
     body = target.body
+    if body.header_kind != "tiny":
+        return False
     return data[body.code_offset : body.code_offset + 6] == expected_il(target.completed_task_token)
+
+
+def is_legacy_fat_code_patch(data: bytes | bytearray, target: PatchTarget) -> bool:
+    """Detect the first implementation that only replaced IL inside the old fat body.
+
+    That variant can still leave an unsuitable method body header/local signature in
+    place and has been observed to raise InvalidProgramException on FE 8.0.1.
+    """
+
+    body = target.body
+    return body.header_kind != "tiny" and data[body.code_offset : body.code_offset + 6] == expected_il(
+        target.completed_task_token
+    )
 
 
 def patch_file(path: Path, *, dry_run: bool, type_full_name_override: Optional[str], backup_suffix: str) -> int:
@@ -238,13 +261,17 @@ def patch_file(path: Path, *, dry_run: bool, type_full_name_override: Optional[s
         print(f"Header kind:        {target.body.header_kind}")
         print(f"CompletedTask ref:  0x{target.completed_task_token:08X}")
 
-        new_il = expected_il(target.completed_task_token)
-        if target.body.code_size < len(new_il):
-            raise RuntimeError(f"Method body too small: {target.body.code_size} bytes")
+        new_body = expected_tiny_body(target.completed_task_token)
+        old_body_span = target.body.header_size + target.body.code_size
+        if old_body_span < len(new_body):
+            raise RuntimeError(f"Method body too small: {old_body_span} bytes")
 
         if is_patched(data, target):
             print("Status:             already patched")
             return 0
+
+        if is_legacy_fat_code_patch(data, target):
+            print("Status:             legacy fat-header patch found; converting to tiny-body patch")
 
         if dry_run:
             print("Status:             dry-run only; no file was changed")
@@ -257,11 +284,15 @@ def patch_file(path: Path, *, dry_run: bool, type_full_name_override: Optional[s
         else:
             print(f"Backup:             {backup} (already exists)")
 
-        # Preserve original method code size and exception-section layout.
-        # The replacement returns immediately; remaining bytes are NOP padding.
-        start = target.body.code_offset
-        end = start + target.body.code_size
-        data[start:end] = new_il + bytes([0x00]) * (target.body.code_size - len(new_il))
+        # Replace the entire method body header with a tiny method body:
+        #   tiny-header(size=6), call Task.CompletedTask, ret
+        #
+        # This deliberately does not preserve the old fat header/local signature.
+        # Keeping the old fat header while replacing only the IL can trigger
+        # InvalidProgramException in FE 8.x during JIT compilation.
+        start = target.body.body_offset
+        end = start + old_body_span
+        data[start:end] = new_body + bytes([0x00]) * (old_body_span - len(new_body))
     finally:
         try:
             dn.close()
