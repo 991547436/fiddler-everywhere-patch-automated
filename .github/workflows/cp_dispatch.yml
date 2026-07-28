@@ -233,9 +233,13 @@ jobs:
           Set-Content -Path ".git/info/sparse-checkout" -Value "server"
           $msojocsBranch = "main"
           $patchingVersion = $env:VERSION_TO_PATCH
-          if (-not [string]::IsNullOrEmpty($patchingVersion) -and [version]$patchingVersion -ge [version]"8.0.0") {
+          if ([string]::IsNullOrWhiteSpace($patchingVersion)) {
+            throw "VERSION_TO_PATCH is empty; cannot select msojocs branch"
+          }
+          if ([version]$patchingVersion -ge [version]"8.0.0") {
             $msojocsBranch = "v8.x"
           }
+          Write-Host "FE version to patch: $patchingVersion"
           Write-Host "Using msojocs/fiddler-everywhere-enhance branch: $msojocsBranch"
           git pull origin $msojocsBranch
 

@@ -212,6 +212,11 @@ jobs:
 
   download-msojocs-server:
     runs-on: ubuntu-latest
+    needs:
+      - scrape_fe_version
+
+    env:
+      SCRAPED_VERSION: ${{ needs.scrape_fe_version.outputs.scraped_version }}
 
     steps:
       - name: Set up Git
@@ -225,9 +230,13 @@ jobs:
           Set-Content -Path ".git/info/sparse-checkout" -Value "server"
           $msojocsBranch = "main"
           $patchingVersion = $env:SCRAPED_VERSION
-          if (-not [string]::IsNullOrEmpty($patchingVersion) -and [version]$patchingVersion -ge [version]"8.0.0") {
+          if ([string]::IsNullOrWhiteSpace($patchingVersion)) {
+            throw "SCRAPED_VERSION is empty; cannot select msojocs branch"
+          }
+          if ([version]$patchingVersion -ge [version]"8.0.0") {
             $msojocsBranch = "v8.x"
           }
+          Write-Host "FE version to patch: $patchingVersion"
           Write-Host "Using msojocs/fiddler-everywhere-enhance branch: $msojocsBranch"
           git pull origin $msojocsBranch
 
